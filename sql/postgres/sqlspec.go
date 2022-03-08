@@ -91,7 +91,13 @@ func MarshalSpec(v interface{}, marshaler schemaspec.Marshaler) ([]byte, error) 
 }
 
 var (
-	hclState = schemahcl.New(schemahcl.WithTypes(TypeRegistry.Specs()))
+	hclState = schemahcl.New(
+		schemahcl.WithTypes(TypeRegistry.Specs()),
+		schemahcl.WithScopedEnums("table.index.type", IndexTypeBTree, IndexTypeHash, IndexTypeGIN, IndexTypeGiST),
+		schemahcl.WithScopedEnums("table.column.identity.generated", GeneratedTypeAlways, GeneratedTypeByDefault),
+		schemahcl.WithScopedEnums("table.foreign_key.on_update", specutil.ReferenceVars...),
+		schemahcl.WithScopedEnums("table.foreign_key.on_delete", specutil.ReferenceVars...),
+	)
 	// UnmarshalHCL unmarshals an Atlas HCL DDL document into v.
 	UnmarshalHCL = schemaspec.UnmarshalerFunc(func(bytes []byte, i interface{}) error {
 		return UnmarshalSpec(bytes, hclState, i)
@@ -168,7 +174,7 @@ func Schema(spec *sqlspec.Schema, tables []*sqlspec.Table, enums []*Enum) (*sche
 // ForeignKeySpecs into ForeignKeys, as the target tables do not necessarily exist in the schema
 // at this point. Instead, the linking is done by the convertSchema function.
 func convertTable(spec *sqlspec.Table, parent *schema.Schema) (*schema.Table, error) {
-	return specutil.Table(spec, parent, convertColumn, specutil.PrimaryKey, specutil.Index, specutil.Check)
+	return specutil.Table(spec, parent, convertColumn, specutil.PrimaryKey, convertIndex, specutil.Check)
 }
 
 // convertColumn converts a sqlspec.Column into a schema.Column.
@@ -176,7 +182,37 @@ func convertColumn(spec *sqlspec.Column, _ *schema.Table) (*schema.Column, error
 	if err := fixDefaultQuotes(spec.Default); err != nil {
 		return nil, err
 	}
-	return specutil.Column(spec, convertColumnType)
+	c, err := specutil.Column(spec, convertColumnType)
+	if err != nil {
+		return nil, err
+	}
+	if r, ok := spec.Extra.Resource("identity"); ok {
+		id, err := convertIdentity(r)
+		if err != nil {
+			return nil, err
+		}
+		c.Attrs = append(c.Attrs, id)
+	}
+	return c, nil
+}
+
+func convertIdentity(r *schemaspec.Resource) (*Identity, error) {
+	var spec struct {
+		Generation string `spec:"generated"`
+		Start      int64  `spec:"start"`
+		Increment  int64  `spec:"increment"`
+	}
+	if err := r.As(&spec); err != nil {
+		return nil, err
+	}
+	id := &Identity{Generation: specutil.FromVar(spec.Generation), Sequence: &Sequence{}}
+	if spec.Start != 0 {
+		id.Sequence.Start = spec.Start
+	}
+	if spec.Increment != 0 {
+		id.Sequence.Increment = spec.Increment
+	}
+	return id, nil
 }
 
 // fixDefaultQuotes fixes the quotes on the Default field to be single quotes
@@ -194,6 +230,22 @@ func fixDefaultQuotes(value schemaspec.Value) error {
 		lv.V = "'" + uq + "'"
 	}
 	return nil
+}
+
+// convertIndex converts a sqlspec.Index into a schema.Index.
+func convertIndex(spec *sqlspec.Index, parent *schema.Table) (*schema.Index, error) {
+	idx, err := specutil.Index(spec, parent)
+	if err != nil {
+		return nil, err
+	}
+	if attr, ok := spec.Attr("type"); ok {
+		t, err := attr.String()
+		if err != nil {
+			return nil, err
+		}
+		idx.Attrs = append(idx.Attrs, &IndexType{T: t})
+	}
+	return idx, nil
 }
 
 const defaultTimePrecision = 6
@@ -300,15 +352,53 @@ func tableSpec(tab *schema.Table) (*sqlspec.Table, error) {
 		tab,
 		columnSpec,
 		specutil.FromPrimaryKey,
-		specutil.FromIndex,
+		indexSpec,
 		specutil.FromForeignKey,
 		specutil.FromCheck,
 	)
 }
 
+func indexSpec(idx *schema.Index) (*sqlspec.Index, error) {
+	spec, err := specutil.FromIndex(idx)
+	if err != nil {
+		return nil, err
+	}
+	// Avoid printing the index type if it is the default.
+	if i := (IndexType{}); sqlx.Has(idx.Attrs, &i) && i.T != IndexTypeBTree {
+		spec.Extra.Attrs = append(spec.Extra.Attrs, specutil.VarAttr("type", strings.ToUpper(i.T)))
+	}
+	return spec, nil
+}
+
 // columnSpec converts from a concrete Postgres schema.Column into a sqlspec.Column.
-func columnSpec(col *schema.Column, _ *schema.Table) (*sqlspec.Column, error) {
-	return specutil.FromColumn(col, columnTypeSpec)
+func columnSpec(c *schema.Column, _ *schema.Table) (*sqlspec.Column, error) {
+	s, err := specutil.FromColumn(c, columnTypeSpec)
+	if err != nil {
+		return nil, err
+	}
+	if i := (&Identity{}); sqlx.Has(c.Attrs, i) {
+		s.Extra.Children = append(s.Extra.Children, fromIdentity(i))
+	}
+	return s, nil
+}
+
+// fromIdentity returns the resource spec for representing the identity attributes.
+func fromIdentity(i *Identity) *schemaspec.Resource {
+	id := &schemaspec.Resource{
+		Type: "identity",
+		Attrs: []*schemaspec.Attr{
+			specutil.VarAttr("generated", strings.ToUpper(specutil.Var(i.Generation))),
+		},
+	}
+	if s := i.Sequence; s != nil {
+		if s.Start != 1 {
+			id.Attrs = append(id.Attrs, specutil.Int64Attr("start", s.Start))
+		}
+		if s.Increment != 1 {
+			id.Attrs = append(id.Attrs, specutil.Int64Attr("increment", s.Increment))
+		}
+	}
+	return id
 }
 
 // columnTypeSpec converts from a concrete Postgres schema.Type into sqlspec.Column Type.
@@ -334,8 +424,8 @@ var TypeRegistry = specutil.NewRegistry(
 	specutil.WithSpecs(
 		specutil.TypeSpec(TypeBit, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "len", Kind: reflect.Int64})),
 		specutil.AliasTypeSpec("bit_varying", TypeBitVar, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "len", Kind: reflect.Int64})),
-		specutil.TypeSpec(TypeVarChar, specutil.WithAttributes(specutil.SizeTypeAttr(true))),
-		specutil.AliasTypeSpec("character_varying", TypeCharVar, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "size", Kind: reflect.Int})),
+		specutil.TypeSpec(TypeVarChar, specutil.WithAttributes(specutil.SizeTypeAttr(false))),
+		specutil.AliasTypeSpec("character_varying", TypeCharVar, specutil.WithAttributes(specutil.SizeTypeAttr(false))),
 		specutil.TypeSpec(TypeChar, specutil.WithAttributes(specutil.SizeTypeAttr(true))),
 		specutil.TypeSpec(TypeCharacter, specutil.WithAttributes(specutil.SizeTypeAttr(true))),
 		specutil.TypeSpec(TypeInt2),

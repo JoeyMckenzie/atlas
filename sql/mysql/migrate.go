@@ -95,10 +95,11 @@ func (s *state) topLevel(changes []schema.Change) ([]schema.Change, error) {
 	for _, c := range changes {
 		switch c := c.(type) {
 		case *schema.AddSchema:
-			b := Build("CREATE DATABASE").Ident(c.S.Name)
+			b := Build("CREATE DATABASE")
 			if sqlx.Has(c.Extra, &schema.IfNotExists{}) {
 				b.P("IF NOT EXISTS")
 			}
+			b.Ident(c.S.Name)
 			// Schema was created with CHARSET and it is not the default database character set.
 			if a := (schema.Charset{}); sqlx.Has(c.S.Attrs, &a) && a.V != "" && a.V != s.charset {
 				b.P("CHARSET", a.V)
@@ -114,10 +115,11 @@ func (s *state) topLevel(changes []schema.Change) ([]schema.Change, error) {
 				Comment: fmt.Sprintf("add new schema named %q", c.S.Name),
 			})
 		case *schema.DropSchema:
-			b := Build("DROP DATABASE").Ident(c.S.Name)
+			b := Build("DROP DATABASE")
 			if sqlx.Has(c.Extra, &schema.IfExists{}) {
 				b.P("IF EXISTS")
 			}
+			b.Ident(c.S.Name)
 			s.append(&migrate.Change{
 				Cmd:     b.String(),
 				Source:  c,
@@ -200,11 +202,12 @@ func (s *state) modifySchema(modify *schema.ModifySchema) error {
 func (s *state) addTable(add *schema.AddTable) error {
 	var (
 		errors []string
-		b      = Build("CREATE TABLE").Table(add.T)
+		b      = Build("CREATE TABLE")
 	)
 	if sqlx.Has(add.Extra, &schema.IfNotExists{}) {
 		b.P("IF NOT EXISTS")
 	}
+	b.Table(add.T)
 	b.Wrap(func(b *sqlx.Builder) {
 		b.MapComma(add.T.Columns, func(i int, b *sqlx.Builder) {
 			if err := s.column(b, add.T, add.T.Columns[i]); err != nil {
@@ -213,20 +216,14 @@ func (s *state) addTable(add *schema.AddTable) error {
 		})
 		if pk := add.T.PrimaryKey; pk != nil {
 			b.Comma().P("PRIMARY KEY")
-			s.indexParts(b, pk.Parts)
-			s.attr(b, pk.Attrs...)
+			indexParts(b, pk.Parts)
 		}
 		if len(add.T.Indexes) > 0 {
 			b.Comma()
 		}
 		b.MapComma(add.T.Indexes, func(i int, b *sqlx.Builder) {
 			idx := add.T.Indexes[i]
-			if idx.Unique {
-				b.P("UNIQUE")
-			}
-			b.P("INDEX").Ident(idx.Name)
-			s.indexParts(b, idx.Parts)
-			s.attr(b, idx.Attrs...)
+			index(b, idx)
 		})
 		if len(add.T.ForeignKeys) > 0 {
 			b.Comma()
@@ -257,10 +254,11 @@ func (s *state) addTable(add *schema.AddTable) error {
 // dropTable builds and appends the migrate.Change
 // for dropping a table from a schema.
 func (s *state) dropTable(drop *schema.DropTable) {
-	b := Build("DROP TABLE").Table(drop.T)
+	b := Build("DROP TABLE")
 	if sqlx.Has(drop.Extra, &schema.IfExists{}) {
 		b.P("IF EXISTS")
 	}
+	b.Table(drop.T)
 	s.append(&migrate.Change{
 		Cmd:     b.String(),
 		Source:  drop,
@@ -352,22 +350,12 @@ func (s *state) alterTable(t *schema.Table, changes []schema.Change) error {
 			reversible = false
 		case *schema.AddIndex:
 			b.P("ADD")
-			if change.I.Unique {
-				b.P("UNIQUE")
-			}
-			b.P("INDEX").Ident(change.I.Name)
-			s.indexParts(b, change.I.Parts)
-			s.attr(b, change.I.Attrs...)
+			index(b, change.I)
 			reverse.Comma().P("DROP INDEX").Ident(change.I.Name)
 		case *schema.DropIndex:
 			b.P("DROP INDEX").Ident(change.I.Name)
 			reverse.Comma().P("ADD")
-			if change.I.Unique {
-				reverse.P("UNIQUE")
-			}
-			reverse.P("INDEX").Ident(change.I.Name)
-			s.indexParts(reverse, change.I.Parts)
-			s.attr(reverse, change.I.Attrs...)
+			index(reverse, change.I)
 			reversible = true
 		case *schema.AddForeignKey:
 			b.P("ADD")
@@ -498,14 +486,36 @@ func (s *state) column(b *sqlx.Builder, t *schema.Table, c *schema.Column) error
 	return nil
 }
 
-func (s *state) indexParts(b *sqlx.Builder, parts []*schema.IndexPart) {
+func index(b *sqlx.Builder, idx *schema.Index) {
+	var t IndexType
+	if sqlx.Has(idx.Attrs, &t) {
+		t.T = strings.ToUpper(t.T)
+	}
+	switch {
+	case idx.Unique:
+		b.P("UNIQUE")
+	case t.T == IndexTypeFullText || t.T == IndexTypeSpatial:
+		b.P(t.T)
+	}
+	b.P("INDEX").Ident(idx.Name)
+	// Skip BTREE as it is the default type.
+	if t.T == IndexTypeHash {
+		b.P("USING", t.T)
+	}
+	indexParts(b, idx.Parts)
+	if c := (schema.Comment{}); sqlx.Has(idx.Attrs, &c) {
+		b.P("COMMENT", quote(c.Text))
+	}
+}
+
+func indexParts(b *sqlx.Builder, parts []*schema.IndexPart) {
 	b.Wrap(func(b *sqlx.Builder) {
 		b.MapComma(parts, func(i int, b *sqlx.Builder) {
 			switch part := parts[i]; {
 			case part.C != nil:
 				b.Ident(part.C.Name)
 			case part.X != nil:
-				b.WriteString(part.X.(*schema.RawExpr).X)
+				b.WriteString(sqlx.MayWrap(part.X.(*schema.RawExpr).X))
 			}
 			if s := (&SubPart{}); sqlx.Has(parts[i].Attrs, s) {
 				b.WriteString(fmt.Sprintf("(%d)", s.Len))
@@ -675,15 +685,10 @@ func skipAutoChanges(changes []schema.Change) []schema.Change {
 
 // checks writes the CHECK constraint to the builder.
 func (s *state) check(b *sqlx.Builder, c *schema.Check) {
-	expr := c.Expr
-	// Expressions should be wrapped with parens.
-	if t := strings.TrimSpace(expr); !strings.HasPrefix(t, "(") || !strings.HasSuffix(t, ")") {
-		expr = "(" + t + ")"
-	}
 	if c.Name != "" {
 		b.P("CONSTRAINT").Ident(c.Name)
 	}
-	b.P("CHECK", expr)
+	b.P("CHECK", sqlx.MayWrap(c.Expr))
 	if s.supportsEnforceCheck() && sqlx.Has(c.Attrs, &Enforced{}) {
 		b.P("ENFORCED")
 	}

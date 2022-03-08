@@ -20,13 +20,23 @@ the schema of a local database that we will run inside a Docker container.
 ### Install the CLI
 
 <Tabs
-defaultValue="apple-intel"
+defaultValue="apple-intel-brew"
 values={[
-{label: 'MacOS', value: 'apple-intel'},
+{label: 'macOS (Homebrew)', value: 'apple-intel-brew'},
+{label: 'macOS (Plain)', value: 'apple-intel-plain'},
 {label: 'Linux', value: 'linux'},
 {label: 'Windows', value: 'windows'},
 ]}>
-<TabItem value="apple-intel">
+<TabItem value="apple-intel-brew">
+
+Get the latest release with [Homebrew](https://brew.sh/):
+
+```shell
+brew install ariga/tap/atlas
+```
+
+</TabItem>
+<TabItem value="apple-intel-plain">
 
 Download latest release.
 ```shell
@@ -69,11 +79,15 @@ move the atlas binary to a file location on your system PATH.
 </TabItem>
 </Tabs>
 
+:::info
+Latest release is updated twice a day and is based on the most recent tagged release.
+:::
+
 Starting with release [v0.3.0](https://github.com/ariga/atlas/releases/tag/v0.3.0),
 ֿthe distributed binaries include code for a [Management UI](../ui/intro.md) wrapping the
 core Atlas engine that is not currently released publicly. The binaries
 themselves are still released under the same [Apache License 2.0](https://github.com/ariga/atlas/blob/master/LICENSE).
-If you would like to build Atlas from source without the UI follow the instructions [here](../cli.md#building-from-source).
+If you would like to build Atlas from source without the UI follow the instructions [here](../cli/reference.md#building-from-source).
 
 To verify that the CLI is installed correctly run:
 ```shell

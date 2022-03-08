@@ -46,12 +46,34 @@ func Open(db schema.ExecQuerier) (*Driver, error) {
 	if err := sqlx.ScanOne(rows, &c.version, &c.collate, &c.charset); err != nil {
 		return nil, fmt.Errorf("mysql: scan system variables: %w", err)
 	}
+	if c.tidb() {
+		return &Driver{
+			conn:        c,
+			Differ:      &sqlx.Diff{DiffDriver: &tdiff{diff{c}}},
+			Inspector:   &tinspect{inspect{c}},
+			PlanApplier: &tplanApply{planApply{c}},
+		}, nil
+	}
 	return &Driver{
 		conn:        c,
 		Differ:      &sqlx.Diff{DiffDriver: &diff{c}},
 		Inspector:   &inspect{c},
 		PlanApplier: &planApply{c},
 	}, nil
+}
+
+func (d *Driver) dev() *sqlx.DevDriver {
+	return &sqlx.DevDriver{Driver: d, MaxNameLen: 64}
+}
+
+// NormalizeRealm returns the normal representation of the given database.
+func (d *Driver) NormalizeRealm(ctx context.Context, r *schema.Realm) (*schema.Realm, error) {
+	return d.dev().NormalizeRealm(ctx, r)
+}
+
+// NormalizeSchema returns the normal representation of the given database.
+func (d *Driver) NormalizeSchema(ctx context.Context, s *schema.Schema) (*schema.Schema, error) {
+	return d.dev().NormalizeSchema(ctx, s)
 }
 
 // supportsCheck reports if the connected database supports
@@ -99,6 +121,11 @@ func (d *conn) mariadb() bool {
 	return strings.Index(d.version, "MariaDB") > 0
 }
 
+// tidb reports if the Driver is connected to a TiDB database.
+func (d *conn) tidb() bool {
+	return strings.Index(d.version, "TiDB") > 0
+}
+
 // compareV returns an integer comparing two versions according to
 // semantic version precedence.
 func (d *conn) compareV(w string) int {
@@ -115,13 +142,17 @@ func (d *conn) gteV(w string) bool { return d.compareV(w) >= 0 }
 // ltV reports if the connection version is < w.
 func (d *conn) ltV(w string) bool { return d.compareV(w) == -1 }
 
-// MySQL standard unescape field function from its codebase:
-// https://github.com/mysql/mysql-server/blob/8.0/sql/dd/impl/utils.cc
+// unescape strings with backslashes returned
+// for SQL expressions from information schema.
 func unescape(s string) string {
 	var b strings.Builder
-	for i, c := range s {
-		if c != '\\' || i+1 < len(s) && s[i+1] != '\\' && s[i+1] != '=' && s[i+1] != ';' {
-			b.WriteRune(c)
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c != '\\' || i == len(s)-1:
+			b.WriteByte(c)
+		case s[i+1] == '\'', s[i+1] == '\\':
+			b.WriteByte(s[i+1])
+			i++
 		}
 	}
 	return b.String()
@@ -188,6 +219,11 @@ const (
 
 // Additional common constants in MySQL.
 const (
+	IndexTypeBTree    = "BTREE"
+	IndexTypeHash     = "HASH"
+	IndexTypeFullText = "FULLTEXT"
+	IndexTypeSpatial  = "SPATIAL"
+
 	currentTS     = "current_timestamp"
 	defaultGen    = "default_generated"
 	autoIncrement = "auto_increment"

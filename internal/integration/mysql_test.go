@@ -1275,6 +1275,9 @@ func (t *myTest) defaultAttrs() []schema.Attr {
 		collation = "latin1_swedish_ci"
 	)
 	switch {
+	case strings.Contains(t.version, "TiDB"):
+		charset = "utf8mb4"
+		collation = "utf8mb4_bin"
 	case t.version == "8":
 		charset = "utf8mb4"
 		collation = "utf8mb4_0900_ai_ci"

@@ -32,17 +32,20 @@ func ScanOne(rows *sql.Rows, dest ...interface{}) error {
 	return rows.Close()
 }
 
-// ScanFKs scans the rows and adds the foreign-key to the table.
-// Reference elements are added as stubs and should be linked
-// manually by the caller.
-func ScanFKs(t *schema.Table, rows *sql.Rows) error {
-	names := make(map[string]*schema.ForeignKey)
+// SchemaFKs scans the rows and adds the foreign-key to the schema table.
+// Reference elements are added as stubs and should be linked manually by the
+// caller.
+func SchemaFKs(s *schema.Schema, rows *sql.Rows) error {
 	for rows.Next() {
 		var name, table, column, tSchema, refTable, refColumn, refSchema, updateRule, deleteRule string
 		if err := rows.Scan(&name, &table, &column, &tSchema, &refTable, &refColumn, &refSchema, &updateRule, &deleteRule); err != nil {
 			return err
 		}
-		fk, ok := names[name]
+		t, ok := s.Table(table)
+		if !ok {
+			return fmt.Errorf("table %q was not found in schema", table)
+		}
+		fk, ok := t.ForeignKey(name)
 		if !ok {
 			fk = &schema.ForeignKey{
 				Symbol:   name,
@@ -51,10 +54,15 @@ func ScanFKs(t *schema.Table, rows *sql.Rows) error {
 				OnDelete: schema.ReferenceOption(deleteRule),
 				OnUpdate: schema.ReferenceOption(updateRule),
 			}
-			if refTable != t.Name || tSchema != refSchema {
+			switch {
+			case refTable == table:
+			case tSchema == refSchema:
+				if fk.RefTable, ok = s.Table(refTable); !ok {
+					fk.RefTable = &schema.Table{Name: refTable, Schema: s}
+				}
+			case tSchema != refSchema:
 				fk.RefTable = &schema.Table{Name: refTable, Schema: &schema.Schema{Name: refSchema}}
 			}
-			names[name] = fk
 			t.ForeignKeys = append(t.ForeignKeys, fk)
 		}
 		c, ok := t.Column(column)
@@ -67,7 +75,6 @@ func ScanFKs(t *schema.Table, rows *sql.Rows) error {
 			fk.Columns = append(fk.Columns, c)
 			c.ForeignKeys = append(c.ForeignKeys, fk)
 		}
-
 		// Stub referenced columns or link if it's a self-reference.
 		var rc *schema.Column
 		if fk.Table != fk.RefTable {
@@ -333,4 +340,41 @@ func DefaultValue(c *schema.Column) (string, bool) {
 	default:
 		panic(fmt.Sprintf("unexpected default value type: %T", x))
 	}
+}
+
+// MayWrap ensures the given string is wrapped with parentheses.
+// Used by the different drivers to turn strings valid expressions.
+func MayWrap(s string) string {
+	n := len(s) - 1
+	if len(s) < 2 || s[0] != '(' || s[n] != ')' || !balanced(s[1:n]) {
+		return "(" + s + ")"
+	}
+	return s
+}
+
+func balanced(s string) bool {
+	var d int
+	for i := 0; i < len(s) && d >= 0; i++ {
+	Top:
+		switch s[i] {
+		case '(':
+			d++
+		case ')':
+			d--
+		// String or identifier.
+		case '\'', '"', '`':
+			for j := i + 1; j < len(s); j++ {
+				switch s[j] {
+				case '\\':
+					j++
+				case s[i]:
+					i = j
+					break Top
+				}
+			}
+			// Unexpected EOS.
+			return false
+		}
+	}
+	return d == 0
 }

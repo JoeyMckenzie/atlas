@@ -6,13 +6,9 @@ module.exports = {
   baseUrl: '/',
   onBrokenLinks: 'throw',
   onBrokenMarkdownLinks: 'warn',
-  favicon: 'https://atlasgo.io/uploads/favicon.ico',
   organizationName: 'ariga',
   projectName: 'atlas',
   themeConfig: {
-    gtag: {
-      trackingID: 'G-Z88N4TF03R'
-    },
     prism: {
       additionalLanguages: ['hcl'],
     },
@@ -29,7 +25,7 @@ module.exports = {
           position: 'right',
         },
         {
-          href: 'https://github.com/ariga/atlas',
+          href: 'https://discord.gg/zZ6sWVg6NT',
           className: 'header-discord-link',
           position: 'right',
         },{
@@ -55,7 +51,7 @@ module.exports = {
           "title": "Community",
           "items": [
             {"label": "GitHub", "to": "https://github.com/ariga/atlas"},
-            {"label": "Discord", "to": "https://discord.com/invite/QhsmBAWzrC"},
+            {"label": "Discord", "to": "https://discord.gg/zZ6sWVg6NT"},
           ]
         },
       ],
@@ -79,6 +75,9 @@ module.exports = {
           path: "../md",
           showLastUpdateAuthor: false,
           showLastUpdateTime: false,
+        },
+        gtag: {
+          trackingID: 'G-Z88N4TF03R'
         },
         blog: {
           showReadingTime: true,

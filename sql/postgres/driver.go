@@ -65,6 +65,20 @@ func Open(db schema.ExecQuerier) (*Driver, error) {
 	}, nil
 }
 
+func (d *Driver) dev() *sqlx.DevDriver {
+	return &sqlx.DevDriver{Driver: d, MaxNameLen: 63, DropClause: []schema.Clause{&Cascade{}}}
+}
+
+// NormalizeRealm returns the normal representation of the given database.
+func (d *Driver) NormalizeRealm(ctx context.Context, r *schema.Realm) (*schema.Realm, error) {
+	return d.dev().NormalizeRealm(ctx, r)
+}
+
+// NormalizeSchema returns the normal representation of the given database.
+func (d *Driver) NormalizeSchema(ctx context.Context, s *schema.Schema) (*schema.Schema, error) {
+	return d.dev().NormalizeSchema(ctx, s)
+}
+
 // Standard column types (and their aliases) as defined in
 // PostgreSQL codebase/website.
 const (
@@ -133,4 +147,18 @@ const (
 	TypeMoney       = "money"
 	TypeInterval    = "interval"
 	TypeUserDefined = "user-defined"
+)
+
+// List of supported index types.
+const (
+	IndexTypeBTree = "BTREE"
+	IndexTypeHash  = "HASH"
+	IndexTypeGIN   = "GIN"
+	IndexTypeGiST  = "GIST"
+)
+
+// List of "GENERATED" TYPES.
+const (
+	GeneratedTypeAlways    = "ALWAYS"
+	GeneratedTypeByDefault = "BY_DEFAULT" // BY DEFAULT.
 )

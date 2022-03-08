@@ -27,23 +27,15 @@ func (i *inspect) InspectRealm(ctx context.Context, opts *schema.InspectRealmOpt
 	if err != nil {
 		return nil, err
 	}
-	realm := &schema.Realm{Schemas: schemas, Attrs: []schema.Attr{&schema.Charset{V: i.charset}, &schema.Collation{V: i.collate}}}
-	for _, s := range schemas {
-		names, err := i.tableNames(ctx, s.Name, nil)
-		if err != nil {
-			return nil, err
-		}
-		for _, name := range names {
-			t, err := i.inspectTable(ctx, name, &schema.InspectTableOptions{Schema: s.Name}, s)
-			if err != nil {
-				return nil, err
-			}
-			s.Tables = append(s.Tables, t)
-		}
-		s.Realm = realm
+	r := schema.NewRealm(schemas...).SetCharset(i.charset).SetCollation(i.collate)
+	if len(schemas) == 0 {
+		return r, nil
+	}
+	if err := i.inspectTables(ctx, r, nil); err != nil {
+		return nil, err
 	}
 	sqlx.LinkSchemaTables(schemas)
-	return realm, nil
+	return r, nil
 }
 
 // InspectSchema returns schema descriptions of the tables in the given schema.
@@ -53,50 +45,45 @@ func (i *inspect) InspectSchema(ctx context.Context, name string, opts *schema.I
 	if err != nil {
 		return nil, err
 	}
-	if len(schemas) == 0 {
-		return nil, &schema.NotExistError{
-			Err: fmt.Errorf("mysql: schema %q was not found", name),
-		}
+	switch n := len(schemas); {
+	case n == 0:
+		return nil, &schema.NotExistError{Err: fmt.Errorf("mysql: schema %q was not found", name)}
+	case n > 1:
+		return nil, fmt.Errorf("mysql: %d schemas were found for %q", n, name)
 	}
-	s := schemas[0]
-	names, err := i.tableNames(ctx, s.Name, opts)
-	if err != nil {
+	r := schema.NewRealm(schemas...).SetCharset(i.charset).SetCollation(i.collate)
+	if err := i.inspectTables(ctx, r, opts); err != nil {
 		return nil, err
-	}
-	for _, name := range names {
-		t, err := i.inspectTable(ctx, name, &schema.InspectTableOptions{Schema: s.Name}, s)
-		if err != nil {
-			return nil, err
-		}
-		s.Tables = append(s.Tables, t)
 	}
 	sqlx.LinkSchemaTables(schemas)
-	s.Realm = &schema.Realm{Schemas: schemas, Attrs: []schema.Attr{&schema.Charset{V: i.charset}, &schema.Collation{V: i.collate}}}
-	return s, nil
+	return r.Schemas[0], nil
 }
 
-func (i *inspect) inspectTable(ctx context.Context, name string, opts *schema.InspectTableOptions, top *schema.Schema) (*schema.Table, error) {
-	t, err := i.table(ctx, name, opts)
-	if err != nil {
-		return nil, err
+func (i *inspect) inspectTables(ctx context.Context, r *schema.Realm, opts *schema.InspectOptions) error {
+	if err := i.tables(ctx, r, opts); err != nil {
+		return err
 	}
-	if top != nil {
-		// Link the table to its top element if provided.
-		t.Schema = top
+	for _, s := range r.Schemas {
+		if len(s.Tables) == 0 {
+			continue
+		}
+		if err := i.columns(ctx, s); err != nil {
+			return err
+		}
+		if err := i.indexes(ctx, s); err != nil {
+			return err
+		}
+		if err := i.fks(ctx, s); err != nil {
+			return err
+		}
+		if err := i.checks(ctx, s); err != nil {
+			return err
+		}
+		if err := i.showCreate(ctx, s); err != nil {
+			return err
+		}
 	}
-	if err := i.columns(ctx, t); err != nil {
-		return nil, err
-	}
-	if err := i.indexes(ctx, t); err != nil {
-		return nil, err
-	}
-	if err := i.fks(ctx, t); err != nil {
-		return nil, err
-	}
-	if err := i.checks(ctx, t); err != nil {
-		return nil, err
-	}
-	return t, nil
+	return nil
 }
 
 // schemas returns the list of the schemas in the database.
@@ -113,7 +100,7 @@ func (i *inspect) schemas(ctx context.Context, opts *schema.InspectRealmOption) 
 			query = fmt.Sprintf(schemasQueryArgs, "= ?")
 			args = append(args, opts.Schemas[0])
 		case n > 0:
-			query = fmt.Sprintf(schemasQueryArgs, "IN ("+strings.Repeat("?, ", len(opts.Schemas)-1)+"?)")
+			query = fmt.Sprintf(schemasQueryArgs, "IN ("+nArgs(len(opts.Schemas))+")")
 			for _, s := range opts.Schemas {
 				args = append(args, s)
 			}
@@ -145,73 +132,80 @@ func (i *inspect) schemas(ctx context.Context, opts *schema.InspectRealmOption) 
 	return schemas, nil
 }
 
-// table returns the table from the database, or a NotExistError if the table was not found.
-func (i *inspect) table(ctx context.Context, name string, opts *schema.InspectTableOptions) (*schema.Table, error) {
+func (i *inspect) tables(ctx context.Context, realm *schema.Realm, opts *schema.InspectOptions) error {
 	var (
-		args  = []interface{}{name}
-		query = tableQuery
+		args  []interface{}
+		query = fmt.Sprintf(tablesQuery, nArgs(len(realm.Schemas)))
 	)
-	if opts != nil && opts.Schema != "" {
-		query = tableSchemaQuery
-		args = append(args, opts.Schema)
+	for _, s := range realm.Schemas {
+		args = append(args, s.Name)
+	}
+	if opts != nil && len(opts.Tables) > 0 {
+		for _, t := range opts.Tables {
+			args = append(args, t)
+		}
+		query = fmt.Sprintf(tablesQueryArgs, nArgs(len(realm.Schemas)), nArgs(len(opts.Tables)))
 	}
 	rows, err := i.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
-	}
-	var (
-		autoinc                                       sql.NullInt64
-		tSchema, charset, collation, comment, options sql.NullString
-	)
-	if err := sqlx.ScanOne(rows, &tSchema, &charset, &collation, &autoinc, &comment, &options); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, &schema.NotExistError{
-				Err: fmt.Errorf("mysql: table %q was not found", name),
-			}
-		}
-		return nil, err
-	}
-	t := &schema.Table{Name: name, Schema: &schema.Schema{Name: tSchema.String}}
-	if sqlx.ValidString(charset) {
-		t.Attrs = append(t.Attrs, &schema.Charset{
-			V: charset.String,
-		})
-	}
-	if sqlx.ValidString(collation) {
-		t.Attrs = append(t.Attrs, &schema.Collation{
-			V: collation.String,
-		})
-	}
-	if sqlx.ValidString(comment) {
-		t.Attrs = append(t.Attrs, &schema.Comment{
-			Text: comment.String,
-		})
-	}
-	if sqlx.ValidString(options) {
-		t.Attrs = append(t.Attrs, &CreateOptions{
-			V: options.String,
-		})
-	}
-	if autoinc.Valid {
-		t.Attrs = append(t.Attrs, &AutoIncrement{
-			V: autoinc.Int64,
-		})
-	}
-	if err := i.createStmt(ctx, t); err != nil {
-		return nil, err
-	}
-	return t, nil
-}
-
-// columns queries and appends the columns of the given table.
-func (i *inspect) columns(ctx context.Context, t *schema.Table) error {
-	rows, err := i.QueryContext(ctx, columnsQuery, t.Schema.Name, t.Name)
-	if err != nil {
-		return fmt.Errorf("mysql: querying %q columns: %w", t.Name, err)
+		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		if err := i.addColumn(t, rows); err != nil {
+		var (
+			autoinc                                             sql.NullInt64
+			tSchema, name, charset, collation, comment, options sql.NullString
+		)
+		if err := rows.Scan(&tSchema, &name, &charset, &collation, &autoinc, &comment, &options); err != nil {
+			return fmt.Errorf("scan table information: %w", err)
+		}
+		if !sqlx.ValidString(tSchema) || !sqlx.ValidString(name) {
+			return fmt.Errorf("invalid schema or table name: %q.%q", tSchema.String, name.String)
+		}
+		s, ok := realm.Schema(tSchema.String)
+		if !ok {
+			return fmt.Errorf("schema %q was not found in realm", tSchema.String)
+		}
+		t := &schema.Table{Name: name.String}
+		s.AddTables(t)
+		if sqlx.ValidString(charset) {
+			t.Attrs = append(t.Attrs, &schema.Charset{
+				V: charset.String,
+			})
+		}
+		if sqlx.ValidString(collation) {
+			t.Attrs = append(t.Attrs, &schema.Collation{
+				V: collation.String,
+			})
+		}
+		if sqlx.ValidString(comment) {
+			t.Attrs = append(t.Attrs, &schema.Comment{
+				Text: comment.String,
+			})
+		}
+		if sqlx.ValidString(options) {
+			t.Attrs = append(t.Attrs, &CreateOptions{
+				V: options.String,
+			})
+		}
+		if autoinc.Valid {
+			t.Attrs = append(t.Attrs, &AutoIncrement{
+				V: autoinc.Int64,
+			})
+		}
+	}
+	return rows.Close()
+}
+
+// columns queries and appends the columns of the given table.
+func (i *inspect) columns(ctx context.Context, s *schema.Schema) error {
+	rows, err := i.querySchema(ctx, columnsQuery, s)
+	if err != nil {
+		return fmt.Errorf("mysql: query schema %q columns: %w", s.Name, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := i.addColumn(s, rows); err != nil {
 			return fmt.Errorf("mysql: %w", err)
 		}
 	}
@@ -219,10 +213,14 @@ func (i *inspect) columns(ctx context.Context, t *schema.Table) error {
 }
 
 // addColumn scans the current row and adds a new column from it to the table.
-func (i *inspect) addColumn(t *schema.Table, rows *sql.Rows) error {
-	var name, typ, comment, nullable, key, defaults, extra, charset, collation sql.NullString
-	if err := rows.Scan(&name, &typ, &comment, &nullable, &key, &defaults, &extra, &charset, &collation); err != nil {
+func (i *inspect) addColumn(s *schema.Schema, rows *sql.Rows) error {
+	var table, name, typ, comment, nullable, key, defaults, extra, charset, collation sql.NullString
+	if err := rows.Scan(&table, &name, &typ, &comment, &nullable, &key, &defaults, &extra, &charset, &collation); err != nil {
 		return err
+	}
+	t, ok := s.Table(table.String)
+	if !ok {
+		return fmt.Errorf("table %q was not found in schema", table.String)
 	}
 	c := &schema.Column{
 		Name: name.String,
@@ -239,7 +237,7 @@ func (i *inspect) addColumn(t *schema.Table, rows *sql.Rows) error {
 	if err := i.extraAttr(t, c, extra.String); err != nil {
 		return err
 	}
-	if sqlx.ValidString(defaults) {
+	if defaults.Valid {
 		if i.mariadb() {
 			c.Default = i.marDefaultExpr(c, defaults.String)
 		} else {
@@ -277,44 +275,45 @@ func (i *inspect) addColumn(t *schema.Table, rows *sql.Rows) error {
 }
 
 // indexes queries and appends the indexes of the given table.
-func (i *inspect) indexes(ctx context.Context, t *schema.Table) error {
+func (i *inspect) indexes(ctx context.Context, s *schema.Schema) error {
 	query := indexesQuery
 	if i.supportsIndexExpr() {
 		query = indexesExprQuery
 	}
-	rows, err := i.QueryContext(ctx, query, t.Schema.Name, t.Name)
+	rows, err := i.querySchema(ctx, query, s)
 	if err != nil {
-		return fmt.Errorf("mysql: querying %q indexes: %w", t.Name, err)
+		return fmt.Errorf("mysql: query schema %q indexes: %w", s.Name, err)
 	}
 	defer rows.Close()
-	if err := i.addIndexes(t, rows); err != nil {
+	if err := i.addIndexes(s, rows); err != nil {
 		return err
 	}
 	return rows.Err()
 }
 
 // addIndexes scans the rows and adds the indexes to the table.
-func (i *inspect) addIndexes(t *schema.Table, rows *sql.Rows) error {
-	var (
-		hasPK bool
-		names = make(map[string]*schema.Index)
-	)
+func (i *inspect) addIndexes(s *schema.Schema, rows *sql.Rows) error {
+	hasPK := make(map[*schema.Table]bool)
 	for rows.Next() {
 		var (
 			seqno                          int
-			name, indexType                string
+			table, name, indexType         string
 			nonuniq, desc                  sql.NullBool
 			column, subPart, expr, comment sql.NullString
 		)
-		if err := rows.Scan(&name, &column, &nonuniq, &seqno, &indexType, &desc, &comment, &subPart, &expr); err != nil {
-			return fmt.Errorf("mysql: scanning indexes for table %q: %w", t.Name, err)
+		if err := rows.Scan(&table, &name, &column, &nonuniq, &seqno, &indexType, &desc, &comment, &subPart, &expr); err != nil {
+			return fmt.Errorf("mysql: scanning indexes for schema %q: %w", s.Name, err)
+		}
+		t, ok := s.Table(table)
+		if !ok {
+			return fmt.Errorf("table %q was not found in schema", table)
 		}
 		// Ignore primary keys.
 		if name == "PRIMARY" {
-			hasPK = true
+			hasPK[t] = true
 			continue
 		}
-		idx, ok := names[name]
+		idx, ok := t.Index(name)
 		if !ok {
 			idx = &schema.Index{
 				Name:   name,
@@ -329,7 +328,6 @@ func (i *inspect) addIndexes(t *schema.Table, rows *sql.Rows) error {
 					Text: comment.String,
 				})
 			}
-			names[name] = idx
 			t.Indexes = append(t.Indexes, idx)
 		}
 		// Rows are ordered by SEQ_IN_INDEX that specifies the
@@ -337,9 +335,7 @@ func (i *inspect) addIndexes(t *schema.Table, rows *sql.Rows) error {
 		part := &schema.IndexPart{SeqNo: seqno, Desc: desc.Bool}
 		switch {
 		case sqlx.ValidString(expr):
-			part.X = &schema.RawExpr{
-				X: expr.String,
-			}
+			part.X = &schema.RawExpr{X: unescape(expr.String)}
 		case sqlx.ValidString(column):
 			part.C, ok = t.Column(column.String)
 			if !ok {
@@ -360,46 +356,53 @@ func (i *inspect) addIndexes(t *schema.Table, rows *sql.Rows) error {
 		}
 		idx.Parts = append(idx.Parts, part)
 	}
-	if !hasPK && t.PrimaryKey != nil {
-		t.PrimaryKey = nil
+	for _, t := range s.Tables {
+		if !hasPK[t] && t.PrimaryKey != nil {
+			t.PrimaryKey = nil
+		}
 	}
 	return nil
 }
 
 // fks queries and appends the foreign keys of the given table.
-func (i *inspect) fks(ctx context.Context, t *schema.Table) error {
-	rows, err := i.QueryContext(ctx, fksQuery, t.Schema.Name, t.Name)
+func (i *inspect) fks(ctx context.Context, s *schema.Schema) error {
+	rows, err := i.querySchema(ctx, fksQuery, s)
 	if err != nil {
-		return fmt.Errorf("mysql: querying %q foreign keys: %w", t.Name, err)
+		return fmt.Errorf("mysql: querying %q foreign keys: %w", s.Name, err)
 	}
 	defer rows.Close()
-	if err := sqlx.ScanFKs(t, rows); err != nil {
+	if err := sqlx.SchemaFKs(s, rows); err != nil {
 		return fmt.Errorf("mysql: %w", err)
 	}
 	return rows.Err()
 }
 
 // checks queries and appends the check constraints of the given table.
-func (i *inspect) checks(ctx context.Context, t *schema.Table) error {
+func (i *inspect) checks(ctx context.Context, s *schema.Schema) error {
 	query, ok := i.supportsCheck()
 	if !ok {
 		return nil
 	}
-	rows, err := i.QueryContext(ctx, query, t.Schema.Name, t.Name)
+	rows, err := i.querySchema(ctx, query, s)
 	if err != nil {
-		return fmt.Errorf("mysql: querying %q check constraints: %w", t.Name, err)
+		return fmt.Errorf("mysql: querying %q check constraints: %w", s.Name, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var name, clause, enforced sql.NullString
-		if err := rows.Scan(&name, &clause, &enforced); err != nil {
+		var table, name, clause, enforced sql.NullString
+		if err := rows.Scan(&table, &name, &clause, &enforced); err != nil {
 			return fmt.Errorf("mysql: %w", err)
+		}
+		t, ok := s.Table(table.String)
+		if !ok {
+			return fmt.Errorf("table %q was not found in schema", table.String)
 		}
 		check := &schema.Check{
 			Name: name.String,
 			Expr: unescape(clause.String),
 		}
 		if i.mariadb() {
+			check.Expr = clause.String
 			// In MariaDB, JSON is an alias to LONGTEXT. For versions >= 10.4.3, the CHARSET and COLLATE set to utf8mb4
 			// and a CHECK constraint is automatically created for the column as well (i.e. JSON_VALID(`<C>`)). However,
 			// we expect tools like Atlas and Ent to manually add this CHECK for older versions of MariaDB.
@@ -422,26 +425,6 @@ func (i *inspect) checks(ctx context.Context, t *schema.Table) error {
 	return rows.Err()
 }
 
-// tableNames returns a list of all tables exist in the schema.
-func (i *inspect) tableNames(ctx context.Context, schema string, opts *schema.InspectOptions) ([]string, error) {
-	query, args := tablesQuery, []interface{}{schema}
-	if opts != nil && len(opts.Tables) > 0 {
-		query = fmt.Sprintf(tablesQueryArgs, strings.Repeat("?, ", len(opts.Tables)-1)+"?")
-		for _, s := range opts.Tables {
-			args = append(args, s)
-		}
-	}
-	rows, err := i.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("mysql: querying schema tables: %w", err)
-	}
-	names, err := sqlx.ScanStrings(rows)
-	if err != nil {
-		return nil, fmt.Errorf("mysql: scanning table names: %w", err)
-	}
-	return names, nil
-}
-
 var reTimeOnUpdate = regexp.MustCompile(`(?i)^(?:default_generated )?on update (current_timestamp(?:\(\d?\))?)$`)
 
 // extraAttr parses the EXTRA column from the INFORMATION_SCHEMA.COLUMNS table
@@ -455,16 +438,11 @@ func (i *inspect) extraAttr(t *schema.Table, c *schema.Column, extra string) err
 		// and it is handled in Driver.addColumn.
 	case el == autoIncrement:
 		a := &AutoIncrement{}
-		// A table can have only one AUTO_INCREMENT column. If it was returned as NULL
-		// from INFORMATION_SCHEMA, it is due to information_schema_stats_expiry and we
-		// need to extract it from the 'CREATE TABLE' command.
 		if !sqlx.Has(t.Attrs, a) {
-			inc, err := i.autoinc(t)
-			if err != nil {
-				return err
-			}
-			*a = *inc
-			t.Attrs = append(t.Attrs, a)
+			// A table can have only one AUTO_INCREMENT column. If it was returned as NULL
+			// from INFORMATION_SCHEMA, it is due to information_schema_stats_expiry and we
+			// need to extract it from the 'CREATE TABLE' command.
+			putShow(t).auto = a
 		}
 		c.Attrs = append(c.Attrs, a)
 	case reTimeOnUpdate.MatchString(extra):
@@ -475,23 +453,49 @@ func (i *inspect) extraAttr(t *schema.Table, c *schema.Column, extra string) err
 	return nil
 }
 
+// showCreate sets and fixes schema elements that require information from
+// the 'SHOW CREATE' command.
+func (i *inspect) showCreate(ctx context.Context, s *schema.Schema) error {
+	for _, t := range s.Tables {
+		st, ok := popShow(t)
+		if !ok {
+			continue
+		}
+		if err := i.createStmt(ctx, t); err != nil {
+			return err
+		}
+		if err := i.setAutoInc(st, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 var reAutoinc = regexp.MustCompile(`(?i)\s+AUTO_INCREMENT\s*=\s*(\d+)\s+`)
 
-// autoinc extracts the updated AUTO_INCREMENT from CREATE TABLE.
-func (i *inspect) autoinc(t *schema.Table) (*AutoIncrement, error) {
+// setAutoInc extracts the updated AUTO_INCREMENT from CREATE TABLE.
+func (i *inspect) setAutoInc(s *showTable, t *schema.Table) error {
+	if s.auto == nil {
+		return nil
+	}
 	var c CreateStmt
 	if !sqlx.Has(t.Attrs, &c) {
-		return nil, fmt.Errorf("missing CREATE TABLE statment in attribuets for %q", t.Name)
+		return fmt.Errorf("missing CREATE TABLE statment in attribuets for %q", t.Name)
+	}
+	if sqlx.Has(t.Attrs, &AutoIncrement{}) {
+		return fmt.Errorf("unexpected AUTO_INCREMENT attributes for table: %q", t.Name)
 	}
 	matches := reAutoinc.FindStringSubmatch(c.S)
 	if len(matches) != 2 {
-		return &AutoIncrement{}, nil
+		return nil
 	}
 	v, err := strconv.ParseInt(matches[1], 10, 64)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &AutoIncrement{V: v}, nil
+	s.auto.V = v
+	t.Attrs = append(t.Attrs, s.auto)
+	return nil
 }
 
 // createStmt loads the CREATE TABLE statement for the table.
@@ -539,7 +543,8 @@ func parseColumn(typ string) (parts []string, size int64, unsigned bool, err err
 	switch parts = strings.FieldsFunc(typ, func(r rune) bool {
 		return r == '(' || r == ')' || r == ' ' || r == ','
 	}); parts[0] {
-	case TypeTinyInt, TypeSmallInt, TypeMediumInt, TypeInt, TypeBigInt:
+	case TypeTinyInt, TypeSmallInt, TypeMediumInt, TypeInt, TypeBigInt,
+		TypeDecimal, TypeNumeric, TypeFloat, TypeDouble, TypeReal:
 		if attr := parts[len(parts)-1]; attr == "unsigned" || attr == "zerofill" {
 			unsigned = true
 		}
@@ -568,6 +573,10 @@ func isHex(x string) bool { return len(x) > 2 && strings.ToLower(x[:2]) == "0x" 
 
 // marDefaultExpr returns the correct schema.Expr based on the column attributes for MariaDB.
 func (i *inspect) marDefaultExpr(c *schema.Column, x string) schema.Expr {
+	// Unlike MySQL, NULL means default to NULL or no default.
+	if x == "NULL" {
+		return nil
+	}
 	// From MariaDB 10.2.7, string-based literals are quoted to distinguish them from expressions.
 	if i.gteV("10.2.7") && sqlx.IsQuoted(x, '\'') {
 		return &schema.Literal{V: x}
@@ -596,6 +605,16 @@ func (i *inspect) marDefaultExpr(c *schema.Column, x string) schema.Expr {
 	return &schema.RawExpr{X: x}
 }
 
+func (i *inspect) querySchema(ctx context.Context, query string, s *schema.Schema) (*sql.Rows, error) {
+	args := []interface{}{s.Name}
+	for _, t := range s.Tables {
+		args = append(args, t.Name)
+	}
+	return i.QueryContext(ctx, fmt.Sprintf(query, nArgs(len(s.Tables))), args...)
+}
+
+func nArgs(n int) string { return strings.Repeat("?, ", n-1) + "?" }
+
 const (
 	// Query to list system variables.
 	variablesQuery = "SELECT @@version, @@collation_server, @@character_set_server"
@@ -606,23 +625,17 @@ const (
 	// Query to list specific database schemas.
 	schemasQueryArgs = "SELECT `SCHEMA_NAME`, `DEFAULT_CHARACTER_SET_NAME`, `DEFAULT_COLLATION_NAME` from `INFORMATION_SCHEMA`.`SCHEMATA` WHERE `SCHEMA_NAME` %s ORDER BY `SCHEMA_NAME`"
 
-	// Query to list schema tables.
-	tablesQuery = "SELECT `TABLE_NAME` FROM `INFORMATION_SCHEMA`.`TABLES` WHERE `TABLE_TYPE` = 'BASE TABLE' AND `TABLE_SCHEMA` = ? ORDER BY `TABLE_NAME`"
-
-	// Query to list specific schema tables.
-	tablesQueryArgs = "SELECT `TABLE_NAME` FROM `INFORMATION_SCHEMA`.`TABLES` WHERE `TABLE_TYPE` = 'BASE TABLE' AND `TABLE_SCHEMA` = ? AND `TABLE_NAME` IN (%s) ORDER BY `TABLE_NAME`"
-
 	// Query to list table columns.
-	columnsQuery = "SELECT `COLUMN_NAME`, `COLUMN_TYPE`, `COLUMN_COMMENT`, `IS_NULLABLE`, `COLUMN_KEY`, `COLUMN_DEFAULT`, `EXTRA`, `CHARACTER_SET_NAME`, `COLLATION_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS` WHERE `TABLE_SCHEMA` = ? AND `TABLE_NAME` = ? ORDER BY `ORDINAL_POSITION`"
+	columnsQuery = "SELECT `TABLE_NAME`, `COLUMN_NAME`, `COLUMN_TYPE`, `COLUMN_COMMENT`, `IS_NULLABLE`, `COLUMN_KEY`, `COLUMN_DEFAULT`, `EXTRA`, `CHARACTER_SET_NAME`, `COLLATION_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS` WHERE `TABLE_SCHEMA` = ? AND `TABLE_NAME` IN (%s) ORDER BY `ORDINAL_POSITION`"
 
 	// Query to list table indexes.
-	indexesQuery     = "SELECT `INDEX_NAME`, `COLUMN_NAME`, `NON_UNIQUE`, `SEQ_IN_INDEX`, `INDEX_TYPE`, UPPER(`COLLATION`) = 'D' AS `DESC`, `INDEX_COMMENT`, `SUB_PART`, NULL AS `EXPRESSION` FROM `INFORMATION_SCHEMA`.`STATISTICS` WHERE `TABLE_SCHEMA` = ? AND `TABLE_NAME` = ? ORDER BY `index_name`, `seq_in_index`"
-	indexesExprQuery = "SELECT `INDEX_NAME`, `COLUMN_NAME`, `NON_UNIQUE`, `SEQ_IN_INDEX`, `INDEX_TYPE`, UPPER(`COLLATION`) = 'D' AS `DESC`, `INDEX_COMMENT`, `SUB_PART`, `EXPRESSION` FROM `INFORMATION_SCHEMA`.`STATISTICS` WHERE `TABLE_SCHEMA` = ? AND `TABLE_NAME` = ? ORDER BY `index_name`, `seq_in_index`"
+	indexesQuery     = "SELECT `TABLE_NAME`, `INDEX_NAME`, `COLUMN_NAME`, `NON_UNIQUE`, `SEQ_IN_INDEX`, `INDEX_TYPE`, UPPER(`COLLATION`) = 'D' AS `DESC`, `INDEX_COMMENT`, `SUB_PART`, NULL AS `EXPRESSION` FROM `INFORMATION_SCHEMA`.`STATISTICS` WHERE `TABLE_SCHEMA` = ? AND `TABLE_NAME` IN (%s) ORDER BY `index_name`, `seq_in_index`"
+	indexesExprQuery = "SELECT `TABLE_NAME`, `INDEX_NAME`, `COLUMN_NAME`, `NON_UNIQUE`, `SEQ_IN_INDEX`, `INDEX_TYPE`, UPPER(`COLLATION`) = 'D' AS `DESC`, `INDEX_COMMENT`, `SUB_PART`, `EXPRESSION` FROM `INFORMATION_SCHEMA`.`STATISTICS` WHERE `TABLE_SCHEMA` = ? AND `TABLE_NAME` IN (%s) ORDER BY `index_name`, `seq_in_index`"
 
-	// Query to list table information.
-	tableQuery = `
+	tablesQuery = `
 SELECT
 	t1.TABLE_SCHEMA,
+	t1.TABLE_NAME,
 	t2.CHARACTER_SET_NAME,
 	t1.TABLE_COLLATION,
 	t1.AUTO_INCREMENT,
@@ -630,15 +643,18 @@ SELECT
 	t1.CREATE_OPTIONS
 FROM
 	INFORMATION_SCHEMA.TABLES AS t1
-	JOIN INFORMATION_SCHEMA.COLLATIONS AS t2
+	LEFT JOIN INFORMATION_SCHEMA.COLLATIONS AS t2
 	ON t1.TABLE_COLLATION = t2.COLLATION_NAME
 WHERE
-	TABLE_NAME = ?
-	AND TABLE_SCHEMA = (SELECT DATABASE())
+	TABLE_SCHEMA IN (%s)
+ORDER BY
+	TABLE_SCHEMA, TABLE_NAME
 `
-	tableSchemaQuery = `
+
+	tablesQueryArgs = `
 SELECT
 	t1.TABLE_SCHEMA,
+	t1.TABLE_NAME,
 	t2.CHARACTER_SET_NAME,
 	t1.TABLE_COLLATION,
 	t1.AUTO_INCREMENT,
@@ -649,13 +665,15 @@ FROM
 	JOIN INFORMATION_SCHEMA.COLLATIONS AS t2
 	ON t1.TABLE_COLLATION = t2.COLLATION_NAME
 WHERE
-	TABLE_NAME = ?
-	AND TABLE_SCHEMA = ?
+	TABLE_SCHEMA IN (%s)
+	AND TABLE_NAME IN (%s)
+ORDER BY
+	TABLE_SCHEMA, TABLE_NAME
 `
 
 	// Query to list table check constraints.
-	myChecksQuery  = `SELECT t1.CONSTRAINT_NAME, t2.CHECK_CLAUSE, t1.ENFORCED` + checksQuery
-	marChecksQuery = `SELECT t1.CONSTRAINT_NAME, t2.CHECK_CLAUSE, "YES" AS ENFORCED` + checksQuery
+	myChecksQuery  = `SELECT t1.TABLE_NAME, t1.CONSTRAINT_NAME, t2.CHECK_CLAUSE, t1.ENFORCED` + checksQuery
+	marChecksQuery = `SELECT t1.TABLE_NAME, t1.CONSTRAINT_NAME, t2.CHECK_CLAUSE, "YES" AS ENFORCED` + checksQuery
 	checksQuery    = `
 FROM
 	INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t1
@@ -664,7 +682,7 @@ FROM
 WHERE
 	t1.CONSTRAINT_TYPE = 'CHECK'
 	AND t1.TABLE_SCHEMA = ?
-	AND t1.TABLE_NAME = ?
+	AND t1.TABLE_NAME IN (%s)
 ORDER BY
 	t1.CONSTRAINT_NAME
 `
@@ -692,7 +710,7 @@ FROM
 WHERE
 	t2.CONSTRAINT_TYPE = 'FOREIGN KEY'
 	AND t1.TABLE_SCHEMA = ?
-	AND t1.TABLE_NAME = ?
+	AND t1.TABLE_NAME IN (%s)
 ORDER BY
 	t1.CONSTRAINT_NAME,
 	t1.ORDINAL_POSITION`
@@ -752,7 +770,7 @@ type (
 	// IndexType represents an index type.
 	IndexType struct {
 		schema.Attr
-		T string // BTREE, FULLTEXT, HASH, RTREE
+		T string // BTREE, HASH, FULLTEXT, SPATIAL, RTREE
 	}
 
 	// BitType represents a bit type.
@@ -766,4 +784,34 @@ type (
 		schema.Type
 		Values []string
 	}
+
+	// putShow is an intermediate table attribute used
+	// on inspection to indicate if the 'SHOW TABLE' is
+	// required and for what.
+	showTable struct {
+		schema.Attr
+		// AUTO_INCREMENT value to due missing value in information_schema.
+		auto *AutoIncrement
+	}
 )
+
+func putShow(t *schema.Table) *showTable {
+	for i := range t.Attrs {
+		if s, ok := t.Attrs[i].(*showTable); ok {
+			return s
+		}
+	}
+	s := &showTable{}
+	t.Attrs = append(t.Attrs, s)
+	return s
+}
+
+func popShow(t *schema.Table) (*showTable, bool) {
+	for i := range t.Attrs {
+		if s, ok := t.Attrs[i].(*showTable); ok {
+			t.Attrs = append(t.Attrs[:i], t.Attrs[i+1:]...)
+			return s, true
+		}
+	}
+	return nil, false
+}

@@ -3,6 +3,7 @@ package mysql
 import (
 	"fmt"
 	"reflect"
+	"strings"
 
 	"ariga.io/atlas/schema/schemaspec"
 	"ariga.io/atlas/schema/schemaspec/schemahcl"
@@ -63,7 +64,12 @@ func MarshalSpec(v interface{}, marshaler schemaspec.Marshaler) ([]byte, error) 
 }
 
 var (
-	hclState = schemahcl.New(schemahcl.WithTypes(TypeRegistry.Specs()))
+	hclState = schemahcl.New(
+		schemahcl.WithTypes(TypeRegistry.Specs()),
+		schemahcl.WithScopedEnums("table.index.type", IndexTypeBTree, IndexTypeHash, IndexTypeFullText, IndexTypeSpatial),
+		schemahcl.WithScopedEnums("table.foreign_key.on_update", specutil.ReferenceVars...),
+		schemahcl.WithScopedEnums("table.foreign_key.on_delete", specutil.ReferenceVars...),
+	)
 	// UnmarshalHCL unmarshals an Atlas HCL DDL document into v.
 	UnmarshalHCL = schemaspec.UnmarshalerFunc(func(bytes []byte, i interface{}) error {
 		return UnmarshalSpec(bytes, hclState, i)
@@ -78,14 +84,39 @@ var (
 // ForeignKeySpecs into ForeignKeys, as the target tables do not necessarily exist in the schema
 // at this point. Instead, the linking is done by the convertSchema function.
 func convertTable(spec *sqlspec.Table, parent *schema.Schema) (*schema.Table, error) {
-	t, err := specutil.Table(spec, parent, convertColumn, specutil.PrimaryKey, specutil.Index, convertCheck)
+	t, err := specutil.Table(spec, parent, convertColumn, specutil.PrimaryKey, convertIndex, convertCheck)
 	if err != nil {
 		return nil, err
 	}
 	if err := convertCharset(spec, &t.Attrs); err != nil {
 		return nil, err
 	}
+	// MySQL allows setting the initial AUTO_INCREMENT value
+	// on the table definition.
+	if attr, ok := spec.Attr("auto_increment"); ok {
+		v, err := attr.Int64()
+		if err != nil {
+			return nil, err
+		}
+		t.AddAttrs(&AutoIncrement{V: v})
+	}
 	return t, err
+}
+
+// convertIndex converts a sqlspec.Index into a schema.Index.
+func convertIndex(spec *sqlspec.Index, parent *schema.Table) (*schema.Index, error) {
+	idx, err := specutil.Index(spec, parent)
+	if err != nil {
+		return nil, err
+	}
+	if attr, ok := spec.Attr("type"); ok {
+		t, err := attr.String()
+		if err != nil {
+			return nil, err
+		}
+		idx.Attrs = append(idx.Attrs, &IndexType{T: t})
+	}
+	return idx, nil
 }
 
 // convertCheck converts a sqlspec.Check into a schema.Check.
@@ -120,6 +151,15 @@ func convertColumn(spec *sqlspec.Column, _ *schema.Table) (*schema.Column, error
 		}
 		c.AddAttrs(&OnUpdate{A: exp.X})
 	}
+	if attr, ok := spec.Attr("auto_increment"); ok {
+		b, err := attr.Bool()
+		if err != nil {
+			return nil, err
+		}
+		if b {
+			c.AddAttrs(&AutoIncrement{})
+		}
+	}
 	return c, err
 }
 
@@ -138,7 +178,7 @@ func schemaSpec(s *schema.Schema) (*sqlspec.Schema, []*sqlspec.Table, error) {
 		sc.Extra.Attrs = append(sc.Extra.Attrs, specutil.StrAttr("charset", c))
 	}
 	if c, ok := hasCollate(s.Attrs, nil); ok {
-		sc.Extra.Attrs = append(sc.Extra.Attrs, specutil.StrAttr("collation", c))
+		sc.Extra.Attrs = append(sc.Extra.Attrs, specutil.StrAttr("collate", c))
 	}
 	return sc, t, nil
 }
@@ -149,7 +189,7 @@ func tableSpec(t *schema.Table) (*sqlspec.Table, error) {
 		t,
 		columnSpec,
 		specutil.FromPrimaryKey,
-		specutil.FromIndex,
+		indexSpec,
 		specutil.FromForeignKey,
 		checkSpec,
 	)
@@ -160,9 +200,21 @@ func tableSpec(t *schema.Table) (*sqlspec.Table, error) {
 		ts.Extra.Attrs = append(ts.Extra.Attrs, specutil.StrAttr("charset", c))
 	}
 	if c, ok := hasCollate(t.Attrs, t.Schema.Attrs); ok {
-		ts.Extra.Attrs = append(ts.Extra.Attrs, specutil.StrAttr("collation", c))
+		ts.Extra.Attrs = append(ts.Extra.Attrs, specutil.StrAttr("collate", c))
 	}
 	return ts, nil
+}
+
+func indexSpec(idx *schema.Index) (*sqlspec.Index, error) {
+	spec, err := specutil.FromIndex(idx)
+	if err != nil {
+		return nil, err
+	}
+	// Avoid printing the index type if it is the default.
+	if i := (IndexType{}); sqlx.Has(idx.Attrs, &i) && i.T != IndexTypeBTree {
+		spec.Extra.Attrs = append(spec.Extra.Attrs, specutil.VarAttr("type", strings.ToUpper(i.T)))
+	}
+	return spec, nil
 }
 
 // columnSpec converts from a concrete MySQL schema.Column into a sqlspec.Column.
@@ -175,10 +227,13 @@ func columnSpec(c *schema.Column, t *schema.Table) (*sqlspec.Column, error) {
 		col.Extra.Attrs = append(col.Extra.Attrs, specutil.StrAttr("charset", c))
 	}
 	if c, ok := hasCollate(c.Attrs, t.Attrs); ok {
-		col.Extra.Attrs = append(col.Extra.Attrs, specutil.StrAttr("collation", c))
+		col.Extra.Attrs = append(col.Extra.Attrs, specutil.StrAttr("collate", c))
 	}
 	if o := (OnUpdate{}); sqlx.Has(c.Attrs, &o) {
 		col.Extra.Attrs = append(col.Extra.Attrs, specutil.RawAttr("on_update", o.A))
+	}
+	if sqlx.Has(c.Attrs, &AutoIncrement{}) {
+		col.Extra.Attrs = append(col.Extra.Attrs, specutil.BoolAttr("auto_increment", true))
 	}
 	return col, nil
 }
@@ -218,7 +273,12 @@ func convertCharset(spec specutil.Attrer, attrs *[]schema.Attr) error {
 		}
 		*attrs = append(*attrs, &schema.Charset{V: s})
 	}
-	if attr, ok := spec.Attr("collation"); ok {
+	// For backwards compatibility, accepts both "collate" and "collation".
+	attr, ok := spec.Attr("collate")
+	if !ok {
+		attr, ok = spec.Attr("collation")
+	}
+	if ok {
 		s, err := attr.String()
 		if err != nil {
 			return err
@@ -239,7 +299,7 @@ func hasCharset(attr []schema.Attr, parent []schema.Attr) (string, bool) {
 	return "", false
 }
 
-// hasCollate reports if the attribute contains the "collation" attribute,
+// hasCollate reports if the attribute contains the "collation"/"collate" attribute,
 // and it needs to be defined explicitly on the schema. This is true, in
 // case the element collation is different from its parent collation.
 func hasCollate(attr []schema.Attr, parent []schema.Attr) (string, bool) {
@@ -279,11 +339,11 @@ var TypeRegistry = specutil.NewRegistry(
 		specutil.TypeSpec(TypeSmallInt, specutil.WithAttributes(unsignedTypeAttr(), specutil.SizeTypeAttr(false))),
 		specutil.TypeSpec(TypeMediumInt, specutil.WithAttributes(unsignedTypeAttr(), specutil.SizeTypeAttr(false))),
 		specutil.TypeSpec(TypeBigInt, specutil.WithAttributes(unsignedTypeAttr(), specutil.SizeTypeAttr(false))),
-		specutil.TypeSpec(TypeDecimal, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
-		specutil.TypeSpec(TypeNumeric, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
-		specutil.TypeSpec(TypeFloat, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
-		specutil.TypeSpec(TypeDouble, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
-		specutil.TypeSpec(TypeReal, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
+		specutil.TypeSpec(TypeDecimal, specutil.WithAttributes(unsignedTypeAttr(), &schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
+		specutil.TypeSpec(TypeNumeric, specutil.WithAttributes(unsignedTypeAttr(), &schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
+		specutil.TypeSpec(TypeFloat, specutil.WithAttributes(unsignedTypeAttr(), &schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
+		specutil.TypeSpec(TypeDouble, specutil.WithAttributes(unsignedTypeAttr(), &schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
+		specutil.TypeSpec(TypeReal, specutil.WithAttributes(unsignedTypeAttr(), &schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false}, &schemaspec.TypeAttr{Name: "scale", Kind: reflect.Int, Required: false})),
 		specutil.TypeSpec(TypeTimestamp, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false})),
 		specutil.TypeSpec(TypeDate, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false})),
 		specutil.TypeSpec(TypeTime, specutil.WithAttributes(&schemaspec.TypeAttr{Name: "precision", Kind: reflect.Int, Required: false})),

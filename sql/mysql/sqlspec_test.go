@@ -23,9 +23,11 @@ table "table" {
 	}
 	column "price1" {
 		type = int
+		auto_increment = false
 	}
 	column "price2" {
 		type = int
+		auto_increment = true
 	}
 	column "account_name" {
 		type = varchar(32)
@@ -57,7 +59,7 @@ table "table" {
 		ref_columns = [
 			table.accounts.column.name,
 		]
-		on_delete = "SET NULL"
+		on_delete = SET_NULL
 	}
 	check "positive price" {
 		expr = "price1 > 0"
@@ -71,11 +73,20 @@ table "table" {
 		enforced = false
 	}
 	comment = "table comment"
+	auto_increment = 1000
 }
 
 table "accounts" {
 	column "name" {
 		type = varchar(32)
+	}
+	column "unsigned_float" {
+		type     = float(10)
+		unsigned = true
+	}
+	column "unsigned_decimal" {
+		type     = decimal(10,2)
+		unsigned = true
 	}
 	primary_key {
 		columns = [table.accounts.column.name]
@@ -128,6 +139,7 @@ table "accounts" {
 							T: TypeInt,
 						},
 					},
+					Attrs: []schema.Attr{&AutoIncrement{}},
 				},
 				{
 					Name: "account_name",
@@ -174,6 +186,7 @@ table "accounts" {
 					Attrs: []schema.Attr{&Enforced{V: false}},
 				},
 				&schema.Comment{Text: "table comment"},
+				&AutoIncrement{V: 1000},
 			},
 		},
 		{
@@ -186,6 +199,27 @@ table "accounts" {
 						Type: &schema.StringType{
 							T:    TypeVarchar,
 							Size: 32,
+						},
+					},
+				},
+				{
+					Name: "unsigned_float",
+					Type: &schema.ColumnType{
+						Type: &schema.FloatType{
+							T:         TypeFloat,
+							Precision: 10,
+							Unsigned:  true,
+						},
+					},
+				},
+				{
+					Name: "unsigned_decimal",
+					Type: &schema.ColumnType{
+						Type: &schema.DecimalType{
+							T:         TypeDecimal,
+							Precision: 10,
+							Scale:     2,
+							Unsigned:  true,
 						},
 					},
 				},
@@ -300,10 +334,10 @@ func TestMarshalSpec_Charset(t *testing.T) {
 	const expected = `table "users" {
   schema = schema.test
   column "a" {
-    null      = false
-    type      = text
-    charset   = "latin1"
-    collation = "latin1_swedish_ci"
+    null    = false
+    type    = text
+    charset = "latin1"
+    collate = "latin1_swedish_ci"
   }
   column "b" {
     null = false
@@ -311,23 +345,23 @@ func TestMarshalSpec_Charset(t *testing.T) {
   }
 }
 table "posts" {
-  schema    = schema.test
-  charset   = "latin1"
-  collation = "latin1_swedish_ci"
+  schema  = schema.test
+  charset = "latin1"
+  collate = "latin1_swedish_ci"
   column "a" {
     null = false
     type = text
   }
   column "b" {
-    null      = false
-    type      = text
-    charset   = "utf8mb4"
-    collation = "utf8mb4_0900_ai_ci"
+    null    = false
+    type    = text
+    charset = "utf8mb4"
+    collate = "utf8mb4_0900_ai_ci"
   }
 }
 schema "test" {
-  charset   = "utf8mb4"
-  collation = "utf8mb4_0900_ai_ci"
+  charset = "utf8mb4"
+  collate = "utf8mb4_0900_ai_ci"
 }
 `
 	require.EqualValues(t, expected, string(buf))
@@ -415,7 +449,7 @@ func TestMarshalSpec_Comment(t *testing.T) {
   }
   index "index" {
     unique  = true
-    columns = [table.users.column.a]
+    columns = [column.a]
     comment = "index comment"
   }
 }
@@ -424,6 +458,41 @@ table "posts" {
   column "a" {
     null = false
     type = text
+  }
+}
+schema "test" {
+}
+`
+	require.EqualValues(t, expected, string(buf))
+}
+
+func TestMarshalSpec_AutoIncrement(t *testing.T) {
+	s := &schema.Schema{
+		Name: "test",
+		Tables: []*schema.Table{
+			{
+				Name: "users",
+				Columns: []*schema.Column{
+					{
+						Name: "id",
+						Type: &schema.ColumnType{Type: &schema.IntegerType{T: "bigint"}},
+						Attrs: []schema.Attr{
+							&AutoIncrement{},
+						},
+					},
+				},
+			},
+		},
+	}
+	s.Tables[0].Schema = s
+	buf, err := MarshalSpec(s, hclState)
+	require.NoError(t, err)
+	const expected = `table "users" {
+  schema = schema.test
+  column "id" {
+    null           = false
+    type           = bigint
+    auto_increment = true
   }
 }
 schema "test" {
@@ -537,7 +606,7 @@ func TestMarshalSpec_IndexParts(t *testing.T) {
   index "idx" {
     on {
       desc   = true
-      column = table.users.column.name
+      column = column.name
     }
     on {
       expr = "lower(name)"
@@ -594,6 +663,47 @@ func TestMarshalSpec_TimePrecision(t *testing.T) {
   column "tYear" {
     null = false
     type = year(2)
+  }
+}
+schema "test" {
+}
+`
+	require.EqualValues(t, expected, string(buf))
+}
+
+func TestMarshalSpec_FloatUnsigned(t *testing.T) {
+	s := schema.New("test").
+		AddTables(
+			schema.NewTable("test").
+				AddColumns(
+					schema.NewFloatColumn(
+						"float_col",
+						TypeFloat,
+						schema.FloatPrecision(10),
+						schema.FloatUnsigned(true),
+					),
+					schema.NewDecimalColumn(
+						"decimal_col",
+						TypeDecimal,
+						schema.DecimalPrecision(10),
+						schema.DecimalScale(2),
+						schema.DecimalUnsigned(true),
+					),
+				),
+		)
+	buf, err := MarshalSpec(s, hclState)
+	require.NoError(t, err)
+	const expected = `table "test" {
+  schema = schema.test
+  column "float_col" {
+    null     = false
+    type     = float(10)
+    unsigned = true
+  }
+  column "decimal_col" {
+    null     = false
+    type     = decimal(10,2)
+    unsigned = true
   }
 }
 schema "test" {
@@ -734,8 +844,18 @@ func TestTypes(t *testing.T) {
 			expected: &schema.DecimalType{T: TypeDecimal, Precision: 10, Scale: 2},
 		},
 		{
+			typeExpr:  "decimal(10,2)",
+			extraAttr: "unsigned=true",
+			expected:  &schema.DecimalType{T: TypeDecimal, Precision: 10, Scale: 2, Unsigned: true},
+		},
+		{
 			typeExpr: "numeric",
 			expected: &schema.DecimalType{T: TypeNumeric},
+		},
+		{
+			typeExpr:  "numeric",
+			extraAttr: "unsigned=true",
+			expected:  &schema.DecimalType{T: TypeNumeric, Unsigned: true},
 		},
 		{
 			typeExpr: "numeric(10)",
@@ -750,12 +870,22 @@ func TestTypes(t *testing.T) {
 			expected: &schema.FloatType{T: TypeFloat, Precision: 10},
 		},
 		{
+			typeExpr:  "float(10)",
+			extraAttr: "unsigned=true",
+			expected:  &schema.FloatType{T: TypeFloat, Precision: 10, Unsigned: true},
+		},
+		{
 			typeExpr: "double(10,0)",
 			expected: &schema.FloatType{T: TypeDouble, Precision: 10},
 		},
 		{
 			typeExpr: "real",
 			expected: &schema.FloatType{T: TypeReal},
+		},
+		{
+			typeExpr:  "real",
+			extraAttr: "unsigned=true",
+			expected:  &schema.FloatType{T: TypeReal, Unsigned: true},
 		},
 		{
 			typeExpr: "timestamp",

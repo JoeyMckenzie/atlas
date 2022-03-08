@@ -15,28 +15,39 @@ module.exports = {
         {
             type: 'category',
             label: 'Getting Started',
+            collapsed: false,
             items: [
                 'getting-started/getting-started-installation',
                 'getting-started/getting-started-inspection',
-                'getting-started/getting-started-apply'
+                'getting-started/getting-started-apply',
+                'getting-started/getting-started-management-ui',
             ]
         },
         {
             type: 'category',
             label: 'Data Definition Language',
+            collapsed: false,
             items: [
-                {type: 'doc', id: 'ddl/ddl-intro', label: 'Introduction'},
-                {type: 'doc', id: 'ddl/ddl-sql', label: 'SQL'},
-                {type: 'doc', id: 'ddl/ddl-sql-types', label: 'SQL Types'},
+                'ddl/ddl-sql',
+                'ddl/ddl-sql-types',
+                'ddl/ddl-intro',
+            ],
+        },
+        {
+            type: 'category',
+            label: 'CLI',
+            items: [
+                {type: 'doc', id: 'cli/cli-reference', label: 'Reference'},
+                {type: 'doc', id: 'cli/cli-url', label: 'URLs'},
             ]
         },
         {
             type: 'doc',
-            id: 'cli-reference',
+            id: 'ui/atlas-ui-intro',
         },
         {
             type: 'doc',
-            id: 'ui/atlas-ui-intro',
+            id: 'deployment/deployment',
         },
         {
             type: 'category',

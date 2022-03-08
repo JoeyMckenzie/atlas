@@ -22,7 +22,7 @@ import (
 )
 
 type (
-	// Mux is used for routing dsn to correct provider.
+	// Mux is used for routing URLs to their correct provider.
 	Mux struct {
 		providers map[string]func(string) (*Driver, error)
 	}
@@ -43,8 +43,9 @@ func NewMux() *Mux {
 }
 
 var (
-	defaultMux = NewMux()
-	inMemory   = regexp.MustCompile("^file:.*:memory:$|:memory:|^file:.*mode=memory.*")
+	// DefaultMux is the default Mux that is used by the different commands.
+	DefaultMux = NewMux()
+	reMemMode  = regexp.MustCompile(":memory:|^file:.*mode=memory.*")
 )
 
 // RegisterProvider is used to register a Driver provider by key.
@@ -56,8 +57,8 @@ func (u *Mux) RegisterProvider(key string, p func(string) (*Driver, error)) {
 }
 
 // OpenAtlas is used for opening an atlas driver on a specific data source.
-func (u *Mux) OpenAtlas(dsn string) (*Driver, error) {
-	key, dsn, err := parseDSN(dsn)
+func (u *Mux) OpenAtlas(url string) (*Driver, error) {
+	key, dsn, err := urlParts(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init atlas driver, %s", err)
 	}
@@ -73,22 +74,22 @@ func (u *Mux) OpenAtlas(dsn string) (*Driver, error) {
 	return p(dsn)
 }
 
-func parseDSN(url string) (string, string, error) {
+func urlParts(url string) (string, string, error) {
 	a := strings.SplitN(url, "://", 2)
 	if len(a) != 2 {
-		return "", "", fmt.Errorf(`failed to parse dsn: "%s"`, url)
+		return "", "", fmt.Errorf(`failed to parse url: "%s"`, url)
 	}
 	return a[0], a[1], nil
 }
 
-// SchemaNameFromDSN parses the dsn the returns schema name
-func SchemaNameFromDSN(url string) (string, error) {
-	key, dsn, err := parseDSN(url)
+// SchemaNameFromURL parses the url the returns schema name
+func SchemaNameFromURL(url string) (string, error) {
+	key, dsn, err := urlParts(url)
 	if err != nil {
 		return "", err
 	}
 	switch key {
-	case "mysql", "mariadb":
+	case "mysql", "maria", "mariadb":
 		cfg, err := mysql.ParseDSN(dsn)
 		if err != nil {
 			return "", err
@@ -104,15 +105,15 @@ func SchemaNameFromDSN(url string) (string, error) {
 }
 
 func postgresSchema(dsn string) (string, error) {
-	url, err := url.Parse(dsn)
+	u, err := url.Parse(dsn)
 	if err != nil {
 		return "", err
 	}
 	// lib/pq supports setting default schemas via the `search_path` parameter
-	// in a dsn.
+	// in a url.
 	//
 	// See: https://github.com/lib/pq/blob/8446d16b8935fdf2b5c0fe333538ac395e3e1e4b/conn.go#L1155-L1165
-	if schema := url.Query().Get("search_path"); schema != "" {
+	if schema := u.Query().Get("search_path"); schema != "" {
 		return schema, nil
 	}
 	return "", nil
@@ -142,7 +143,7 @@ func schemaName(dsn string) (string, error) {
 }
 
 func sqliteFileExists(dsn string) error {
-	if !inMemory.MatchString(dsn) {
+	if !reMemMode.MatchString(dsn) {
 		return fileExists(dsn)
 	}
 	return nil
@@ -162,4 +163,33 @@ func fileExists(dsn string) error {
 		return fmt.Errorf("failed opening %q: %w", f, err)
 	}
 	return nil
+}
+
+func mysqlDSN(d string) (string, error) {
+	cfg, err := mysql.ParseDSN(d)
+	// A standard MySQL DSN.
+	if err == nil {
+		return d, nil
+	}
+	u, err := url.Parse("mysql://" + d)
+	if err != nil {
+		return "", nil
+	}
+	schema := strings.TrimPrefix(u.Path, "/")
+	// In case of a URL (non-standard DSN),
+	// parse the options from query string.
+	if u.RawQuery != "" {
+		cfg, err = mysql.ParseDSN(fmt.Sprintf("/%s?%s", schema, u.RawQuery))
+		if err != nil {
+			return "", err
+		}
+	} else {
+		cfg = mysql.NewConfig()
+	}
+	cfg.Net = "tcp"
+	cfg.Addr = u.Host
+	cfg.User = u.User.Username()
+	cfg.Passwd, _ = u.User.Password()
+	cfg.DBName = schema
+	return cfg.FormatDSN(), nil
 }

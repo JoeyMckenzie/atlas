@@ -29,6 +29,12 @@ table "table" {
 	column "account_name" {
 		type = varchar(32)
 	}
+	column "varchar_length_is_not_required" {
+		type = varchar
+	}
+	column "character_varying_length_is_not_required" {
+		type = character_varying
+	}
 	column "tags" {
 		type = hstore
 	}
@@ -44,6 +50,7 @@ table "table" {
 		columns = [table.table.column.col]
 	}
 	index "index" {
+		type = HASH
 		unique = true
 		columns = [
 			table.table.column.col,
@@ -58,7 +65,7 @@ table "table" {
 		ref_columns = [
 			table.accounts.column.name,
 		]
-		on_delete = "SET NULL"
+		on_delete = SET_NULL
 	}
 	check "positive price" {
 		expr = "price > 0"
@@ -126,6 +133,24 @@ enum "account_type" {
 						Type: &schema.StringType{
 							T:    "varchar",
 							Size: 32,
+						},
+					},
+				},
+				{
+					Name: "varchar_length_is_not_required",
+					Type: &schema.ColumnType{
+						Type: &schema.StringType{
+							T:    "varchar",
+							Size: 0,
+						},
+					},
+				},
+				{
+					Name: "character_varying_length_is_not_required",
+					Type: &schema.ColumnType{
+						Type: &schema.StringType{
+							T:    "character varying",
+							Size: 0,
 						},
 					},
 				},
@@ -208,6 +233,7 @@ enum "account_type" {
 			},
 			Attrs: []schema.Attr{
 				&schema.Comment{Text: "index comment"},
+				&IndexType{T: IndexTypeHash},
 			},
 		},
 	}
@@ -228,6 +254,70 @@ enum "account_type" {
 		},
 	}
 	require.EqualValues(t, exp, &s)
+}
+
+func TestUnmarshalSpec_IndexType(t *testing.T) {
+	f := `
+schema "s" {}
+table "t" {
+	schema = schema.s
+	column "c" {
+		type = int
+	}
+	index "i" {
+		type = %s
+		columns = [column.c]
+	}
+}
+`
+	t.Run("Invalid", func(t *testing.T) {
+		f := fmt.Sprintf(f, "UNK")
+		err := UnmarshalHCL([]byte(f), &schema.Schema{})
+		require.Error(t, err)
+	})
+	t.Run("Valid", func(t *testing.T) {
+		var (
+			s schema.Schema
+			f = fmt.Sprintf(f, "HASH")
+		)
+		err := UnmarshalHCL([]byte(f), &s)
+		require.NoError(t, err)
+		idx := s.Tables[0].Indexes[0]
+		require.Equal(t, IndexTypeHash, idx.Attrs[0].(*IndexType).T)
+	})
+}
+
+func TestUnmarshalSpec_Identity(t *testing.T) {
+	f := `
+schema "s" {}
+table "t" {
+	schema = schema.s
+	column "c" {
+		type = int
+		identity {
+			generated = %s
+			start = 10
+		}
+	}
+}
+`
+	t.Run("Invalid", func(t *testing.T) {
+		f := fmt.Sprintf(f, "UNK")
+		err := UnmarshalHCL([]byte(f), &schema.Schema{})
+		require.Error(t, err)
+	})
+	t.Run("Valid", func(t *testing.T) {
+		var (
+			s schema.Schema
+			f = fmt.Sprintf(f, "ALWAYS")
+		)
+		err := UnmarshalHCL([]byte(f), &s)
+		require.NoError(t, err)
+		id := s.Tables[0].Columns[0].Attrs[0].(*Identity)
+		require.Equal(t, GeneratedTypeAlways, id.Generation)
+		require.EqualValues(t, 10, id.Sequence.Start)
+		require.Zero(t, id.Sequence.Increment)
+	})
 }
 
 func TestMarshalSpec_Enum(t *testing.T) {

@@ -20,7 +20,7 @@ cmpshow users posts 2.sql
 -- 1.hcl --
 schema "$db" {
     charset = "$charset"
-    collation = "$collate"
+    collate = "$collate"
 }
 
 table "users" {
@@ -36,7 +36,7 @@ table "users" {
 -- invalid-on-delete-action.hcl --
 schema "$db" {
     charset = "$charset"
-    collation = "$collate"
+    collate = "$collate"
 }
 
 table "users" {
@@ -63,14 +63,14 @@ table "posts" {
     foreign_key "owner_id" {
         columns = [table.posts.column.author_id]
         ref_columns = [table.users.column.id]
-        on_delete = "SET NULL"
+        on_delete = SET_NULL
     }
 }
 
 -- invalid-on-update-action.hcl --
 schema "$db" {
     charset = "$charset"
-    collation = "$collate"
+    collate = "$collate"
 }
 
 table "users" {
@@ -97,14 +97,14 @@ table "posts" {
     foreign_key "owner_id" {
     	columns = [table.posts.column.author_id]
     	ref_columns = [table.users.column.id]
-    	on_update = "SET NULL"
+    	on_update = SET_NULL
     }
 }
 
 -- 2.hcl --
 schema "$db" {
     charset = "$charset"
-    collation = "$collate"
+    collate = "$collate"
 }
 
 table "users" {
@@ -132,7 +132,7 @@ table "posts" {
     foreign_key "owner_id" {
     	columns = [table.posts.column.author_id]
     	ref_columns = [table.users.column.id]
-    	on_delete = "SET NULL"
+    	on_delete = SET_NULL
     }
 }
 

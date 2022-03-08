@@ -25,9 +25,9 @@ func TestMigrate_ApplyChanges(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mk.ExpectExec(sqltest.Escape("DROP TABLE `users`")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mk.ExpectExec(sqltest.Escape("DROP TABLE `public`.`pets` IF EXISTS")).
+	mk.ExpectExec(sqltest.Escape("DROP TABLE IF EXISTS `public`.`pets`")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mk.ExpectExec(sqltest.Escape("CREATE TABLE `pets` IF NOT EXISTS (`a` int NOT NULL DEFAULT (int(rand())), `b` bigint NOT NULL DEFAULT 1, `c` bigint NULL, PRIMARY KEY (`a`, `b`), UNIQUE INDEX `b_c_unique` (`b`, `c`) COMMENT \"comment\")")).
+	mk.ExpectExec(sqltest.Escape("CREATE TABLE IF NOT EXISTS `pets` (`a` int NOT NULL DEFAULT (int(rand())), `b` bigint NOT NULL DEFAULT 1, `c` bigint NULL, PRIMARY KEY (`a`, `b`), UNIQUE INDEX `b_c_unique` (`b`, `c`) COMMENT \"comment\")")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mk.ExpectExec(sqltest.Escape("ALTER TABLE `users` DROP INDEX `id_spouse_id`")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -176,6 +176,24 @@ func TestPlanChanges(t *testing.T) {
 		wantPlan *migrate.Plan
 		wantErr  bool
 	}{
+		{
+			input: []schema.Change{
+				&schema.AddSchema{S: schema.New("test").SetCharset("utf8mb4"), Extra: []schema.Clause{&schema.IfNotExists{}}},
+				&schema.DropSchema{S: schema.New("test").SetCharset("utf8mb4"), Extra: []schema.Clause{&schema.IfExists{}}},
+			},
+			wantPlan: &migrate.Plan{
+				Reversible: false,
+				Changes: []*migrate.Change{
+					{
+						Cmd:     "CREATE DATABASE IF NOT EXISTS `test` CHARSET utf8mb4",
+						Reverse: "DROP DATABASE `test`",
+					},
+					{
+						Cmd: "DROP DATABASE IF EXISTS `test`",
+					},
+				},
+			},
+		},
 		{
 			input: []schema.Change{
 				func() schema.Change {
@@ -441,6 +459,7 @@ func TestPlanChanges(t *testing.T) {
 									},
 									Attrs: []schema.Attr{
 										&schema.Comment{Text: "comment"},
+										&IndexType{T: IndexTypeHash},
 									},
 								},
 							},
@@ -463,7 +482,7 @@ func TestPlanChanges(t *testing.T) {
 				Reversible: true,
 				Changes: []*migrate.Change{
 					{
-						Cmd:     "ALTER TABLE `users` ADD COLUMN `name` varchar(255) NOT NULL, ADD INDEX `id_key` (`id`) COMMENT \"comment\", ADD CONSTRAINT `id_nonzero` CHECK (id > 0) ENFORCED, AUTO_INCREMENT 1000",
+						Cmd:     "ALTER TABLE `users` ADD COLUMN `name` varchar(255) NOT NULL, ADD INDEX `id_key` USING HASH (`id`) COMMENT \"comment\", ADD CONSTRAINT `id_nonzero` CHECK (id > 0) ENFORCED, AUTO_INCREMENT 1000",
 						Reverse: "ALTER TABLE `users` DROP COLUMN `name`, DROP INDEX `id_key`, DROP CONSTRAINT `id_nonzero`, AUTO_INCREMENT 1",
 					},
 				},

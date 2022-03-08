@@ -21,23 +21,12 @@ be used individually but are designed to work very well together.
 
 ## Quick Installation
 
-Download latest release.
+On macOS:
+
 ```shell
-curl -LO https://release.ariga.io/atlas/atlas-darwin-amd64-latest
+brew install ariga/tap/atlas
 ```
 
-Make the atlas binary executable.
-```shell
-chmod +x ./atlas-darwin-amd64-latest
-```
-
-Move the atlas binary to a file location on your system PATH.
-```shell
-sudo mv ./atlas-darwin-amd64-latest /usr/local/bin/atlas
-```
-```shell
-sudo chown root: /usr/local/bin/atlas
-```
 Instructions for other platforms and databases: [Getting Started](https://atlasgo.io/).
 
 ## Getting Started
@@ -46,13 +35,13 @@ Instructions for other platforms and databases: [Getting Started](https://atlasg
 
 Inspect and save output to a schema file.
 ```shell
-atlas schema inspect -d "mysql://root:pass@tcp(localhost:3306)/example" > atlas.hcl
+atlas schema inspect -u "mysql://root:pass@tcp(localhost:3306)/example" > atlas.hcl
 ```
 
 ## Apply change to Schema
 
 ```shell
-atlas schema apply -d "mysql://root:pass@tcp(localhost:3306)/example" -f atlas.hcl
+atlas schema apply -u "mysql://root:pass@tcp(localhost:3306)/example" -f atlas.hcl
 ```
 
 Full [CLI documentation](https://atlasgo.io/cli/reference). 

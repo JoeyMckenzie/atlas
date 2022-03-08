@@ -86,10 +86,11 @@ func (s *state) topLevel(changes []schema.Change) []schema.Change {
 	for _, c := range changes {
 		switch c := c.(type) {
 		case *schema.AddSchema:
-			b := Build("CREATE SCHEMA").Ident(c.S.Name)
+			b := Build("CREATE SCHEMA")
 			if sqlx.Has(c.Extra, &schema.IfNotExists{}) {
 				b.P("IF NOT EXISTS")
 			}
+			b.Ident(c.S.Name)
 			s.append(&migrate.Change{
 				Cmd:     b.String(),
 				Source:  c,
@@ -97,9 +98,13 @@ func (s *state) topLevel(changes []schema.Change) []schema.Change {
 				Comment: fmt.Sprintf("Add new schema named %q", c.S.Name),
 			})
 		case *schema.DropSchema:
-			b := Build("DROP SCHEMA").Ident(c.S.Name)
+			b := Build("DROP SCHEMA")
 			if sqlx.Has(c.Extra, &schema.IfExists{}) {
-				b.P("IF NOT EXISTS")
+				b.P("IF EXISTS")
+			}
+			b.Ident(c.S.Name)
+			if sqlx.Has(c.Extra, &Cascade{}) {
+				b.P("CASCADE")
 			}
 			s.append(&migrate.Change{
 				Cmd:     b.String(),
@@ -119,10 +124,11 @@ func (s *state) addTable(ctx context.Context, add *schema.AddTable) error {
 	if err := s.addTypes(ctx, add.T.Columns...); err != nil {
 		return err
 	}
-	b := Build("CREATE TABLE").Table(add.T)
+	b := Build("CREATE TABLE")
 	if sqlx.Has(add.Extra, &schema.IfNotExists{}) {
 		b.P("IF NOT EXISTS")
 	}
+	b.Table(add.T)
 	b.Wrap(func(b *sqlx.Builder) {
 		b.MapComma(add.T.Columns, func(i int, b *sqlx.Builder) {
 			s.column(b, add.T.Columns[i])
@@ -155,10 +161,11 @@ func (s *state) addTable(ctx context.Context, add *schema.AddTable) error {
 
 // dropTable builds and executes the query for dropping a table from a schema.
 func (s *state) dropTable(drop *schema.DropTable) {
-	b := Build("DROP TABLE").Table(drop.T)
+	b := Build("DROP TABLE")
 	if sqlx.Has(drop.Extra, &schema.IfExists{}) {
 		b.P("IF EXISTS")
 	}
+	b.Table(drop.T)
 	s.append(&migrate.Change{
 		Cmd:     b.String(),
 		Source:  drop,
@@ -461,7 +468,7 @@ func (s *state) alterType(from, to *schema.EnumType) error {
 func (s *state) enumExists(ctx context.Context, name string) (bool, error) {
 	rows, err := s.QueryContext(ctx, "SELECT * FROM pg_type WHERE typname = $1 AND typtype = 'e'", name)
 	if err != nil {
-		return false, fmt.Errorf("check index existance: %w", err)
+		return false, fmt.Errorf("check index existence: %w", err)
 	}
 	defer rows.Close()
 	return rows.Next(), rows.Err()
@@ -478,8 +485,7 @@ func (s *state) addIndexes(t *schema.Table, indexes ...*schema.Index) {
 			b.Ident(idx.Name)
 		}
 		b.P("ON").Table(t)
-		s.indexParts(b, idx.Parts)
-		s.indexAttrs(b, idx.Attrs)
+		s.index(b, idx)
 		s.append(&migrate.Change{
 			Cmd:     b.String(),
 			Comment: fmt.Sprintf("Create index %q to table: %q", idx.Name, t.Name),
@@ -585,7 +591,7 @@ func (s *state) alterColumn(b *sqlx.Builder, k schema.ChangeKind, c *schema.Colu
 			}
 			// The syntax for altering identity columns is identical to sequence_options.
 			// https://www.postgresql.org/docs/current/sql-altersequence.html
-			b.P("SET START WITH", strconv.FormatInt(id.Sequence.Start, 10), "SET INCREMENT BY", strconv.FormatInt(id.Sequence.Increment, 10), "RESTART")
+			b.P("SET GENERATED", id.Generation, "SET START WITH", strconv.FormatInt(id.Sequence.Start, 10), "SET INCREMENT BY", strconv.FormatInt(id.Sequence.Increment, 10), "RESTART")
 			k &= ^schema.ChangeAttr
 		case k.Is(schema.ChangeComment):
 			// Handled separately on modifyTable.
@@ -607,7 +613,7 @@ func (s *state) indexParts(b *sqlx.Builder, parts []*schema.IndexPart) {
 			case part.C != nil:
 				b.Ident(part.C.Name)
 			case part.X != nil:
-				b.WriteString(part.X.(*schema.RawExpr).X)
+				b.WriteString(sqlx.MayWrap(part.X.(*schema.RawExpr).X))
 			}
 			s.partAttrs(b, parts[i])
 		})
@@ -639,15 +645,16 @@ func (s *state) partAttrs(b *sqlx.Builder, p *schema.IndexPart) {
 	}
 }
 
-func (s *state) indexAttrs(b *sqlx.Builder, attrs []schema.Attr) {
+func (s *state) index(b *sqlx.Builder, idx *schema.Index) {
 	// Avoid appending the default method.
-	if t := (IndexType{}); sqlx.Has(attrs, &t) && strings.ToLower(t.T) != "btree" {
-		b.P("USING").P(t.T)
+	if t := (IndexType{}); sqlx.Has(idx.Attrs, &t) && strings.ToUpper(t.T) != IndexTypeBTree {
+		b.P("USING", t.T)
 	}
-	if p := (IndexPredicate{}); sqlx.Has(attrs, &p) {
+	s.indexParts(b, idx.Parts)
+	if p := (IndexPredicate{}); sqlx.Has(idx.Attrs, &p) {
 		b.P("WHERE").P(p.P)
 	}
-	for _, attr := range attrs {
+	for _, attr := range idx.Attrs {
 		switch attr.(type) {
 		case *schema.Comment, *ConType, *IndexType, *IndexPredicate:
 		default:
@@ -757,15 +764,10 @@ func commentChange(c schema.Change) (from, to string, err error) {
 
 // checks writes the CHECK constraint to the builder.
 func check(b *sqlx.Builder, c *schema.Check) {
-	expr := c.Expr
-	// Expressions should be wrapped with parens.
-	if t := strings.TrimSpace(expr); !strings.HasPrefix(t, "(") || !strings.HasSuffix(t, ")") {
-		expr = "(" + t + ")"
-	}
 	if c.Name != "" {
 		b.P("CONSTRAINT").Ident(c.Name)
 	}
-	b.P("CHECK", expr)
+	b.P("CHECK", sqlx.MayWrap(c.Expr))
 	if sqlx.Has(c.Attrs, &NoInherit{}) {
 		b.P("NO INHERIT")
 	}

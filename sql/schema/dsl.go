@@ -70,6 +70,41 @@ func (s *Schema) AddTables(tables ...*Table) *Schema {
 	return s
 }
 
+// NewRealm creates a new Realm.
+func NewRealm(schemas ...*Schema) *Realm {
+	r := &Realm{Schemas: schemas}
+	for _, s := range schemas {
+		s.Realm = r
+	}
+	return r
+}
+
+// SetCharset sets or appends the Charset attribute
+// to the realm with the given value.
+func (r *Realm) SetCharset(v string) *Realm {
+	replaceOrAppend(&r.Attrs, &Charset{V: v})
+	return r
+}
+
+// UnsetCharset unsets the Charset attribute.
+func (r *Realm) UnsetCharset() *Realm {
+	del(&r.Attrs, &Charset{})
+	return r
+}
+
+// SetCollation sets or appends the Collation attribute
+// to the realm with the given value.
+func (r *Realm) SetCollation(v string) *Realm {
+	replaceOrAppend(&r.Attrs, &Collation{V: v})
+	return r
+}
+
+// UnsetCollation the Collation attribute.
+func (r *Realm) UnsetCollation() *Realm {
+	del(&r.Attrs, &Collation{})
+	return r
+}
+
 // NewTable creates a new Table.
 func NewTable(name string) *Table {
 	return &Table{Name: name}
@@ -315,6 +350,13 @@ func DecimalScale(scale int) DecimalOption {
 	}
 }
 
+// DecimalUnsigned configures the unsigned of the float type.
+func DecimalUnsigned(unsigned bool) DecimalOption {
+	return func(b *DecimalType) {
+		b.Unsigned = unsigned
+	}
+}
+
 // NewDecimalColumn creates a new DecimalType column.
 func NewDecimalColumn(name, typ string, opts ...DecimalOption) *Column {
 	t := &DecimalType{T: typ}
@@ -337,6 +379,13 @@ type FloatOption func(*FloatType)
 func FloatPrecision(precision int) FloatOption {
 	return func(b *FloatType) {
 		b.Precision = precision
+	}
+}
+
+// FloatUnsigned configures the unsigned of the float type.
+func FloatUnsigned(unsigned bool) FloatOption {
+	return func(b *FloatType) {
+		b.Unsigned = unsigned
 	}
 }
 
